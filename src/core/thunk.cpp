@@ -1090,6 +1090,18 @@ void guest_thread_leave(void* tcb_v) {
     }
 #endif
     t_guest_fs = nullptr;
+#if defined(_WIN32)
+    // scePthreadExit leaves HLE by a longjmp (hle/pthread.cpp), past
+    // hle_host_stack_leave, so the TEB can still give the limits of the host
+    // stack freed below. The thread's exit runs more code on its own stack
+    // (DLL_THREAD_DETACH), whose stack probes and exceptions need its limits.
+    if (t_host_stack_depth > 0) {
+        auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+        tib->StackBase = t_guest_stack_base;
+        tib->StackLimit = t_guest_stack_limit;
+        t_host_stack_depth = 0;
+    }
+#endif
     host_stack_free();
     if (tcb) {
         delete[] (reinterpret_cast<unsigned char*>(tcb) - kGuestTls);

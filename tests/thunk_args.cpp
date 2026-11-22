@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstring>
 #include <pthread.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -140,6 +143,34 @@ GUEST_ABI std::int64_t call_jumper(void* cb) {
     return -1;  // never
 }
 
+#if defined(_WIN32)
+// scePthreadExit's way out (hle/pthread.cpp): a longjmp from inside an HLE
+// call, past the trampoline's return, then guest_thread_leave. Afterwards the
+// TEB must give this thread's own stack again, since Windows still runs code
+// on it as the thread exits (DLL_THREAD_DETACH) and probes against those limits.
+alignas(16) std::uint64_t g_exit_jb[12];
+GUEST_ABI void exit_jumper(std::int64_t) { hle_longjmp_raw(g_exit_jb, 1); }
+
+void* teb_after_exit_thread(void*) {
+    using Fn = void(GUEST_ABI*)(std::int64_t);
+    auto* fn = reinterpret_cast<Fn>(thunk_wrap(reinterpret_cast<void*>(&exit_jumper)));
+    // Read from the TEB too, so taken before anything moves its limits.
+    ULONG_PTR low = 0, high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    void* tcb = guest_thread_enter();
+    if (hle_setjmp_raw(g_exit_jb) == 0) {
+        fn(0);
+    }
+    guest_thread_leave(tcb);
+    const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const auto base = reinterpret_cast<ULONG_PTR>(tib->StackBase);
+    const auto limit = reinterpret_cast<ULONG_PTR>(tib->StackLimit);
+    CHECK(base == high);
+    CHECK(limit >= low && limit < high);
+    return nullptr;
+}
+#endif
+
 // thunk_wrap_capture_frame(): the DL_PANIC path. The loader patches the
 // guest function's first byte, so the stub runs before anything touches the
 // stack and the handler sees the guest's own rsp (pointing at the return
@@ -266,6 +297,10 @@ int main() {
     pthread_t th;
     pthread_create(&th, nullptr, fs_thread, nullptr);
     pthread_join(th, nullptr);
+#if defined(_WIN32)
+    pthread_create(&th, nullptr, teb_after_exit_thread, nullptr);
+    pthread_join(th, nullptr);
+#endif
 
     if (g_fail) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);
